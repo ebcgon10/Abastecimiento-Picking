@@ -10,6 +10,8 @@ st.set_page_config(page_title="Llenado ZM_CAJA | CD Coquimbo", page_icon="📦",
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 M = os.path.join(BASE, "maestros")
+if not os.path.exists(os.path.join(M, "ubicaciones.csv")):
+    M = BASE  # si los maestros quedaron en la raíz del repo
 
 st.markdown("""
 <style>
