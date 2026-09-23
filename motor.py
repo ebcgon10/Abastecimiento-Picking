@@ -412,7 +412,8 @@ def hoja_operarios(movs: pd.DataFrame, incluir_lpn: bool = False) -> pd.DataFram
     """Vista simple para bodega: SKU | Descripción | Origen | Destino | Cantidad."""
     if movs is None or movs.empty:
         return pd.DataFrame()
-    df = movs.copy()
+    # mayor cantidad de cajas a reponer primero
+    df = movs.sort_values(["cajas_a_mover", "ubicacion_destino"], ascending=[False, True])
     out = pd.DataFrame({
         "N°": range(1, len(df) + 1),
         "Pasillo": df["pasillo_destino"].values,
