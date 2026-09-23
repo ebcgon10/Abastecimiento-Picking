@@ -1,12 +1,15 @@
 import os
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+import streamlit.components.v1 as components
 
 import pandas as pd
 import streamlit as st
 
 import motor
 
-st.set_page_config(page_title="Llenado ZM_CAJA | CD Coquimbo", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Abastecimiento Picking | CD Coquimbo", page_icon="📦", layout="wide")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 M = os.path.join(BASE, "maestros")
@@ -47,6 +50,9 @@ with st.sidebar:
     f_vu = st.file_uploader("Operaciones de vida útil (.csv)", type=["csv"])
 
     st.header("2. Parámetros")
+    zonas_sel = st.multiselect("Zonas a llenar", ["ZM_CAJAS", "ZM_PALLET"], default=["ZM_CAJAS"],
+                               help="ZM_CAJAS = zona de movimiento ZM_CAJ · ZM_PALLET = ZM_PICK. "
+                                    "Si eliges ambas, se abastece primero la que aparece primero.")
     areas = st.multiselect("Áreas de origen", ["ALMAC", "ALMPIC"], default=["ALMAC", "ALMPIC"],
                            help="ALMAC = almacenamiento, ALMPIC = almacenamiento picking")
     tol = st.number_input("Tolerancia FEFO (días)", 0, 60, 0,
@@ -93,9 +99,14 @@ try:
     else:
         ub, pr, zm = maestros()
     pal = motor.cargar_paletizado(f_pal) if f_pal else paletizado_base()
+    if not zonas_sel:
+        st.warning("Elige al menos una zona a llenar en la barra lateral.")
+        st.stop()
     movs, resumen, alertas = motor.calcular(cuad, vu, ub, pr, zm, paletizado=pal, areas_origen=areas,
                                             tolerancia_dias=int(tol), vida_util_min=int(vu_min),
-                                            permitir_parcial=parcial, fecha_ref=fecha_ref)
+                                            permitir_parcial=parcial, fecha_ref=fecha_ref,
+                                            zonas_destino=[{"ZM_CAJAS": "ZM_CAJ", "ZM_PALLET": "ZM_PICK"}[z]
+                                                           for z in zonas_sel])
 except Exception as e:
     st.error(f"No se pudo procesar: {e}")
     st.stop()
@@ -109,19 +120,23 @@ c4.metric("Sin stock para reponer", int((resumen["estado"] == "Sin stock en alma
 c5.metric("LPN restos liberados",
           int(((movs["tipo_lpn"] == "Resto") & (movs["queda_en_lpn"] == 0)).sum()) if len(movs) else 0)
 
-tab1, tab2, tab3 = st.tabs(["🚚 Movimientos", "📍 Resumen por ubicación", "⚠️ Alertas"])
+tab1, tab4, tab2, tab3 = st.tabs(["🚚 Movimientos", "🖨️ Hoja para operarios",
+                                  "📍 Resumen por ubicación", "⚠️ Alertas"])
 
 with tab1:
     if movs.empty:
         st.warning("No hay movimientos por realizar con los parámetros actuales.")
     else:
-        f1, f2, f3 = st.columns(3)
-        zt = f1.multiselect("Zona de trabajo", sorted(movs["zona_trabajo"].dropna().unique()))
+        f0, f1, f2, f3 = st.columns(4)
+        zn = f0.multiselect("Zona", sorted(movs["zona"].unique()), key="mv_zona")
+        pa = f1.multiselect("Pasillo destino", sorted(movs["pasillo_destino"].unique()), key="mv_pas")
         tipo = f2.multiselect("Tipo de LPN origen", ["Resto", "Pallet completo"])
         buscar = f3.text_input("Buscar artículo / ubicación / LPN")
         vista = movs.copy()
-        if zt:
-            vista = vista[vista["zona_trabajo"].isin(zt)]
+        if zn:
+            vista = vista[vista["zona"].isin(zn)]
+        if pa:
+            vista = vista[vista["pasillo_destino"].isin(pa)]
         if tipo:
             vista = vista[vista["tipo_lpn"].isin(tipo)]
         if buscar:
@@ -132,6 +147,57 @@ with tab1:
         st.caption("Tipo de LPN según la norma de cajas por pallet de la BBDD. "
                    "pct_pallet = % del pallet que tiene el LPN. Si fuente_norma = Estimada, "
                    "el artículo no está en la BBDD y se usa el mayor LPN visto.")
+
+with tab4:
+    if movs.empty:
+        st.warning("No hay movimientos para imprimir.")
+    else:
+        h1, h2 = st.columns([1, 2])
+        zonas_h = h1.multiselect("Zona", sorted(movs["zona"].unique()),
+                                 default=sorted(movs["zona"].unique()), key="h_zona")
+        base_h = movs[movs["zona"].isin(zonas_h)] if zonas_h else movs
+        pasillos_disp = sorted(base_h["pasillo_destino"].unique())
+        pasillos_h = h2.multiselect("Pasillo destino (primer tramo de la ubicación)", pasillos_disp,
+                                    placeholder="Todos los pasillos", key="h_pas")
+        por_pasillo = st.checkbox("Una hoja por pasillo (salto de página)", value=True)
+
+        sel = base_h[base_h["pasillo_destino"].isin(pasillos_h)] if pasillos_h else base_h
+        sel = sel.sort_values(["pasillo_destino", "ubicacion_destino", "caducidad"])
+        hoja = motor.hoja_operarios(sel)
+
+        if hoja.empty:
+            st.info("No hay tareas con esos filtros.")
+        else:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Tareas", len(hoja))
+            m2.metric("Cajas", int(hoja["Cantidad solicitada"].sum()))
+            m3.metric("Pasillos", hoja["Pasillo"].nunique())
+
+            fecha_hora = datetime.now(ZoneInfo("America/Santiago")).strftime("%d-%m-%Y %H:%M")
+            filtros = f"Zona: {', '.join(zonas_h) or 'Todas'} | Pasillos: {', '.join(pasillos_h) or 'Todos'}"
+            html_report = motor.html_hoja_ruta(hoja, fecha_hora, filtros, pagina_por_pasillo=por_pasillo)
+
+            components.html(
+                f"""
+                {html_report}
+                <div style="margin-top:15px; text-align:center;" class="no-print">
+                    <button onclick="window.print()" style="background-color:#2563EB; color:white;
+                        font-weight:bold; padding:12px 24px; font-size:16px; border:none;
+                        border-radius:6px; cursor:pointer;">🖨️ Imprimir Hoja de Ruta</button>
+                </div>
+                """,
+                height=800, scrolling=True,
+            )
+
+            d1, d2 = st.columns(2)
+            sufijo = "_".join(pasillos_h) if pasillos_h else "todos"
+            d1.download_button("⬇️ Descargar hoja (HTML para imprimir)",
+                               data=f"<html><head><meta charset='utf-8'></head><body>{html_report}</body></html>",
+                               file_name=f"hoja_ruta_pasillo_{sufijo}.html", mime="text/html")
+            d2.download_button("⬇️ Descargar hoja (Excel)",
+                               data=motor.a_excel_hoja(hoja, {"Emisión": fecha_hora, "Filtros": filtros}),
+                               file_name=f"hoja_ruta_pasillo_{sufijo}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 with tab2:
     est = st.multiselect("Estado", sorted(resumen["estado"].unique()),
@@ -152,6 +218,7 @@ with tab3:
 # ------------------------------------------------------------------ descarga
 params = {
     "Fecha de referencia": fecha_ref.strftime("%d-%m-%Y"),
+    "Zonas a llenar": ", ".join(zonas_sel),
     "Áreas de origen": ", ".join(areas),
     "Tolerancia FEFO (días)": int(tol),
     "Vida útil mínima (días)": int(vu_min),
@@ -164,3 +231,4 @@ st.download_button("⬇️ Descargar Excel de movimientos",
                    file_name=f"llenado_ZM_CAJA_{fecha_ref:%Y%m%d}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                    type="primary")
+
