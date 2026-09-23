@@ -1,8 +1,8 @@
 """
-Motor de cálculo: llenado completo de ubicaciones ZM_CAJ
+Motor de cálculo: llenado completo de ubicaciones ZM_CAJ (cajas) y ZM_PICK (pallet)
 --------------------------------------------------------
 Reglas:
-1. Destino  = ubicaciones con zona de movimiento ZM_CAJ que tienen artículo asignado (PREFERENCIA).
+1. Destino  = ubicaciones con zona de movimiento ZM_CAJ / ZM_PICK que tienen artículo asignado (PREFERENCIA).
 2. Faltante = capacidad máxima (piezas/cajas) - stock actual del artículo en la ubicación.
 3. Origen   = LPN en áreas ALMAC / ALMPIC, estado D, que existan en la cuadratura de stock.
 4. Orden    = FEFO (fecha de caducidad más próxima primero); a igual caducidad (o dentro
@@ -14,7 +14,9 @@ import re
 import pandas as pd
 
 AREAS_ORIGEN_DEFAULT = ["ALMAC", "ALMPIC"]
-ZONA_DESTINO = "ZM_CAJ"
+ZONAS_DESTINO_DEFAULT = ["ZM_CAJ"]
+# nombre para mostrar en pantalla / hoja de operarios
+NOMBRE_ZONA = {"ZM_CAJ": "ZM_CAJAS", "ZM_PICK": "ZM_PALLET"}
 
 
 # ------------------------------------------------------------------ utilidades
@@ -135,20 +137,24 @@ def cargar_paletizado(archivo) -> pd.DataFrame:
 # ------------------------------------------------------------------ cálculo
 def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.DataFrame,
              zonas: pd.DataFrame, paletizado: pd.DataFrame = None, areas_origen=None, tolerancia_dias: int = 0,
-             vida_util_min: int = 0, permitir_parcial: bool = True, fecha_ref=None):
+             vida_util_min: int = 0, permitir_parcial: bool = True, fecha_ref=None,
+             zonas_destino=None):
+    """zonas_destino: lista en orden de prioridad (p.ej. ["ZM_CAJ", "ZM_PICK"]);
+    la primera zona se abastece antes que la segunda cuando comparten artículo."""
+    zonas_destino = list(zonas_destino or ZONAS_DESTINO_DEFAULT)
     areas_origen = areas_origen or AREAS_ORIGEN_DEFAULT
     fecha_ref = pd.Timestamp(fecha_ref or pd.Timestamp.today().normalize())
     alertas = []
 
-    # ---------- 1. Ubicaciones destino ZM_CAJ
-    dest = zonas[zonas["zona_movimiento"].str.upper().str.startswith(ZONA_DESTINO)][
+    # ---------- 1. Ubicaciones destino (ZM_CAJ / ZM_PICK)
+    dest = zonas[zonas["zona_movimiento"].str.upper().isin(zonas_destino)][
         ["ubicacion", "zona_trabajo", "zona_movimiento"]].drop_duplicates("ubicacion")
     dest = dest.merge(ubic[["ubicacion", "capacidad", "unidad_cap"]], on="ubicacion", how="left")
     dest = dest.merge(pref[["ubicacion", "articulo", "secuencia"]], on="ubicacion", how="left")
 
     sin_art = dest[dest["articulo"].isna() | (dest["articulo"] == "")]
     for _, r in sin_art.iterrows():
-        alertas.append({"tipo": "Ubicación ZM_CAJ sin artículo asignado", "ubicacion": r["ubicacion"],
+        alertas.append({"tipo": f"Ubicación {NOMBRE_ZONA.get(r['zona_movimiento'], r['zona_movimiento'])} sin artículo asignado", "ubicacion": r["ubicacion"],
                         "articulo": "", "detalle": "No existe en hoja de preferencias"})
     dest = dest[~dest.index.isin(sin_art.index)].copy()
 
@@ -181,7 +187,10 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
     for _, r in sobre.iterrows():
         alertas.append({"tipo": "Sobre capacidad", "ubicacion": r["ubicacion"], "articulo": r["articulo"],
                         "detalle": f"Stock {int(r['stock_actual'])} > capacidad {int(r['capacidad'])}"})
-    dest = dest.sort_values(["secuencia", "ubicacion"]).reset_index(drop=True)
+    dest["prioridad_zona"] = dest["zona_movimiento"].str.upper().map({z: i for i, z in enumerate(zonas_destino)})
+    dest["zona"] = dest["zona_movimiento"].map(lambda z: NOMBRE_ZONA.get(z, z))
+    dest["pasillo"] = dest["ubicacion"].map(pasillo_de)
+    dest = dest.sort_values(["prioridad_zona", "secuencia", "ubicacion"]).reset_index(drop=True)
 
     # ---------- 2. Stock origen: cuadratura (verdad) + vida útil (detalle LPN / fechas)
     cu_o = cuad[cuad["area"].isin(areas_origen) & (cuad["estado_de_inventario"] == "D")]
@@ -301,6 +310,8 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
                         "queda_en_lpn": int(rest - tomar),
                         "accion": "Mover LPN completo" if tomar == rest else f"Parcial (queda resto {int(rest - tomar)})",
                         "ubicacion_destino": d["ubicacion"],
+                        "pasillo_destino": d["pasillo"],
+                        "zona": d["zona"],
                         "zona_trabajo": d["zona_trabajo"],
                     })
                     lpns.at[idx, "restante"] = rest - tomar
@@ -318,6 +329,7 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
                 estado = "Sin stock en almacenamiento"
             resumen.append({
                 "secuencia": d["secuencia"], "ubicacion_destino": d["ubicacion"],
+                "pasillo_destino": d["pasillo"], "zona": d["zona"],
                 "zona_trabajo": d["zona_trabajo"], "articulo": art,
                 "capacidad": int(d["capacidad"]), "stock_actual": int(d["stock_actual"]),
                 "faltante": int(d["faltante"]), "a_reponer": int(asignado),
@@ -331,7 +343,7 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
         columns={"Articulo": "articulo", "Descripcion": "descripcion"})]).drop_duplicates("articulo")
     if not resumen.empty:
         resumen = resumen.merge(desc, on="articulo", how="left")
-        cols = ["secuencia", "ubicacion_destino", "zona_trabajo", "articulo", "descripcion", "capacidad",
+        cols = ["secuencia", "ubicacion_destino", "pasillo_destino", "zona", "zona_trabajo", "articulo", "descripcion", "capacidad",
                 "stock_actual", "faltante", "a_reponer", "stock_final", "pendiente", "estado"]
         resumen = resumen[cols].sort_values(["secuencia", "ubicacion_destino"])
     if not movs.empty:
@@ -351,7 +363,8 @@ def a_excel(movs, resumen, alertas, parametros: dict) -> bytes:
         head = wb.add_format({"bold": True, "font_name": "Arial", "font_size": 10, "bg_color": "#1F3864",
                               "font_color": "white", "border": 1, "text_wrap": True, "valign": "vcenter"})
         body = wb.add_format({"font_name": "Arial", "font_size": 10})
-        hojas = [("Movimientos", movs), ("Resumen ubicaciones", resumen), ("Alertas", alertas)]
+        hojas = [("Hoja operarios", hoja_operarios(movs)), ("Movimientos", movs),
+                 ("Resumen ubicaciones", resumen), ("Alertas", alertas)]
         for nombre, df in hojas:
             df = df if not df.empty else pd.DataFrame({"info": ["Sin registros"]})
             df.to_excel(xw, sheet_name=nombre, index=False)
@@ -366,3 +379,137 @@ def a_excel(movs, resumen, alertas, parametros: dict) -> bytes:
         p.to_excel(xw, sheet_name="Parámetros", index=False)
         xw.sheets["Parámetros"].set_column(0, 1, 40, body)
     return buf.getvalue()
+
+
+def a_excel_hoja(hoja: pd.DataFrame, parametros: dict) -> bytes:
+    """Excel simple solo con la hoja para operarios (lista para imprimir)."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
+        wb = xw.book
+        head = wb.add_format({"bold": True, "font_name": "Arial", "font_size": 10, "bg_color": "#1E293B",
+                              "font_color": "white", "border": 1, "align": "center", "valign": "vcenter"})
+        cel = wb.add_format({"font_name": "Arial", "font_size": 10, "border": 1})
+        tit = wb.add_format({"bold": True, "font_name": "Arial", "font_size": 14})
+        hoja.to_excel(xw, sheet_name="Hoja operarios", index=False, startrow=3)
+        ws = xw.sheets["Hoja operarios"]
+        ws.write(0, 0, "REABASTO ZM / HOJA DE RUTA", tit)
+        ws.write(1, 0, " | ".join(f"{k}: {v}" for k, v in parametros.items()))
+        cols = list(hoja.columns) + ["Check (✓)"]
+        for i, c in enumerate(cols):
+            ws.write(3, i, c, head)
+            ancho = max(len(c), hoja[c].astype(str).str.len().max() if c in hoja and len(hoja) else 0)
+            ws.set_column(i, i, min(max(ancho + 2, 8), 45))
+        for r in range(len(hoja)):
+            for i, c in enumerate(cols):
+                v = hoja.iloc[r][c] if c in hoja else ""
+                ws.write(4 + r, i, v.item() if hasattr(v, "item") else v, cel)
+        ws.set_landscape(); ws.set_paper(9); ws.fit_to_pages(1, 0); ws.repeat_rows(3)
+    return buf.getvalue()
+
+
+# ------------------------------------------------------------------ hoja de operarios
+def hoja_operarios(movs: pd.DataFrame, incluir_lpn: bool = False) -> pd.DataFrame:
+    """Vista simple para bodega: SKU | Descripción | Origen | Destino | Cantidad."""
+    if movs is None or movs.empty:
+        return pd.DataFrame()
+    df = movs.copy()
+    out = pd.DataFrame({
+        "N°": range(1, len(df) + 1),
+        "Pasillo": df["pasillo_destino"].values,
+        "Zona": df["zona"].values,
+        "SKU": df["articulo"].values,
+        "Descripción": df["descripcion"].values,
+        "Ubicación origen": df["ubicacion_origen"].values,
+        "Ubicación destino": df["ubicacion_destino"].values,
+        "Cantidad solicitada": df["cajas_a_mover"].values,
+    })
+    if incluir_lpn:
+        out.insert(6, "LPN", df["lpn"].values)
+        out.insert(7, "Vence", pd.to_datetime(df["caducidad"]).dt.strftime("%d-%m-%Y").values)
+    return out
+
+
+def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por_pasillo: bool = True) -> str:
+    """HTML imprimible (mismo patrón de la hoja de ruta de reabasto)."""
+    from html import escape
+    cols_extra = [c for c in ["LPN", "Vence"] if c in hoja.columns]
+    cab_extra = "".join(f"<th>{c}</th>" for c in cols_extra)
+
+    def bloque(df, titulo_pasillo):
+        filas = ""
+        for i, (_, r) in enumerate(df.iterrows(), start=1):
+            extra = "".join(f'<td class="c mono">{escape(str(r[c]))}</td>' for c in cols_extra)
+            filas += f"""
+            <tr>
+              <td class="c">{i}</td>
+              <td class="mono b">{escape(str(r['SKU']))}</td>
+              <td>{escape(str(r['Descripción']))}</td>
+              <td class="c b org">{escape(str(r['Ubicación origen']))}</td>
+              <td class="c b dst">{escape(str(r['Ubicación destino']))}</td>
+              {extra}
+              <td class="c b qty">{int(r['Cantidad solicitada'])}</td>
+              <td class="chk"></td>
+            </tr>"""
+        zonas_txt = ", ".join(sorted(df["Zona"].unique()))
+        return f"""
+        <div class="report-card">
+          <table class="header-table">
+            <tr><td class="title">Reabasto ZM / Hoja de Ruta</td>
+                <td class="r small"><strong>Fecha emisión:</strong> {fecha_hora}</td></tr>
+            <tr><td class="sub"><strong>{titulo_pasillo}</strong> &nbsp;·&nbsp; Zona: {zonas_txt}
+                 &nbsp;·&nbsp; Tareas: {len(df)} &nbsp;·&nbsp; Cajas: {int(df['Cantidad solicitada'].sum())}</td>
+                <td class="r small">{escape(filtros)}</td></tr>
+          </table>
+          <table class="data-table">
+            <thead><tr>
+              <th>#</th><th>SKU</th><th>Descripción producto</th><th>Origen</th><th>Destino</th>
+              {cab_extra}<th>Cantidad</th><th>Check (✓)</th>
+            </tr></thead>
+            <tbody>{filas}</tbody>
+          </table>
+          <table class="firmas"><tr>
+            <td>Operario: ____________________</td><td>Hora inicio: ______</td>
+            <td>Hora término: ______</td><td>Firma: ____________________</td>
+          </tr></table>
+        </div>"""
+
+    if pagina_por_pasillo:
+        partes = [bloque(g, f"Pasillo {p}") for p, g in hoja.groupby("Pasillo", sort=True)]
+    else:
+        pas = ", ".join(sorted(hoja["Pasillo"].unique()))
+        partes = [bloque(hoja, f"Pasillos: {pas}")]
+    cuerpo = '<div class="salto"></div>'.join(partes)
+
+    return f"""
+    <style>
+      body {{ font-family: Arial, sans-serif; background:#fff; }}
+      .report-card {{ border:2px solid #1E293B; border-radius:8px; padding:18px; margin-bottom:18px;
+                      background:#FFFFFF; color:#0F172A; font-family:Arial, sans-serif; }}
+      .header-table {{ width:100%; border-collapse:collapse; margin-bottom:10px; }}
+      .header-table td {{ padding:3px; }}
+      .title {{ font-size:20px; font-weight:bold; text-transform:uppercase; letter-spacing:1px; }}
+      .sub {{ font-size:14px; color:#334155; }}
+      .small {{ font-size:12px; color:#475569; }}
+      .r {{ text-align:right; }}
+      .data-table {{ width:100%; border-collapse:collapse; margin-top:8px; }}
+      .data-table th {{ background:#1E293B; color:#fff; border:1px solid #1E293B; padding:7px 5px;
+                        font-size:12px; text-transform:uppercase; }}
+      .data-table td {{ border:1px solid #94A3B8; padding:7px 5px; font-size:13px; }}
+      .data-table tr:nth-child(even) td {{ background:#F8FAFC; }}
+      .c {{ text-align:center; }} .b {{ font-weight:bold; }}
+      .mono {{ font-family:monospace; font-size:13px; }}
+      .org {{ color:#1E3A8A; font-size:14px; }} .dst {{ color:#065F46; font-size:14px; }}
+      .qty {{ font-size:16px; }} .chk {{ width:70px; }}
+      .firmas {{ width:100%; margin-top:14px; font-size:12px; }}
+      .firmas td {{ padding-top:10px; }}
+      @media print {{
+        body {{ margin:0; padding:0; }}
+        .no-print {{ display:none !important; }}
+        .report-card {{ border:none; padding:0; margin:0; }}
+        .salto {{ page-break-after:always; break-after:page; }}
+        .data-table tr {{ page-break-inside:avoid; }}
+        .data-table thead {{ display:table-header-group; }}
+        @page {{ size: A4 landscape; margin: 10mm; }}
+      }}
+    </style>
+    {cuerpo}"""
