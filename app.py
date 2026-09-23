@@ -19,10 +19,10 @@ if not os.path.exists(os.path.join(M, "ubicaciones.csv")):
 st.markdown("""
 <style>
 .block-container {padding-top: 1.5rem;}
-.titulo {font-size: 1.8rem; font-weight: 700; color: #1F3864; margin-bottom: 0;}
+.titulo {font-size: 1.8rem; font-weight: 700; color: inherit; margin-bottom: 0;}
 .sub {color: #666; margin-top: 0;}
-div[data-testid="stMetric"] {background: #F3F6FB; border-radius: 10px; padding: 10px 14px;
-                             border-left: 5px solid #1F3864;}
+div[data-testid="stMetric"] {background: rgba(59, 130, 246, 0.10); border-radius: 10px;
+                             padding: 10px 14px; border-left: 5px solid #3B82F6;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -231,4 +231,3 @@ st.download_button("⬇️ Descargar Excel de movimientos",
                    file_name=f"llenado_ZM_CAJA_{fecha_ref:%Y%m%d}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                    type="primary")
-
