@@ -53,24 +53,19 @@ with st.sidebar:
     zonas_sel = st.multiselect("Zonas a llenar", ["ZM_CAJAS", "ZM_PALLET"], default=["ZM_CAJAS"],
                                help="ZM_CAJAS = zona de movimiento ZM_CAJ · ZM_PALLET = ZM_PICK. "
                                     "Si eliges ambas, se abastece primero la que aparece primero.")
-    areas = st.multiselect("Áreas de origen", ["ALMAC", "ALMPIC"], default=["ALMAC", "ALMPIC"],
-                           help="ALMAC = almacenamiento, ALMPIC = almacenamiento picking")
     tol = st.number_input("Tolerancia FEFO (días)", 0, 60, 0,
                           help="0 = FEFO estricto. Con N días, los LPN que vencen dentro de la misma "
                                "ventana se consideran equivalentes y se toman primero los de menos cajas.")
-    vu_min = st.number_input("Excluir LPN con vida útil ≤ (días)", 0, 365, 0,
-                             help="0 = solo excluye vencidos.")
-    parcial = st.checkbox("Permitir sacar cajas de un LPN sin moverlo completo", value=True,
-                          help="Si se desmarca, solo se mueven LPN que caben completos en la ubicación.")
-    fecha_ref = st.date_input("Fecha de referencia", value=date.today(), format="DD-MM-YYYY")
 
-    with st.expander("Maestros (opcional)"):
-        st.caption("La app ya trae ubicaciones, preferencias y zonas. Súbelos aquí solo si cambiaron.")
-        f_ub = st.file_uploader("ubicaciones.csv", type=["csv"], key="ub")
-        f_pr = st.file_uploader("preferencia.csv", type=["csv"], key="pr")
-        f_zm = st.file_uploader("zonas.csv", type=["csv"], key="zm")
-        f_pal = st.file_uploader("Norma de paletizado (BBDD .xlsx o paletizado.csv)",
-                                 type=["xlsx", "csv"], key="pal")
+    st.caption("**Reglas fijas:** origen solo ALMAC y ALMPIC · estado D · no se usan LPN vencidos · "
+               "se permite sacar cajas de un LPN sin moverlo completo · vencimiento calculado "
+               "a la fecha de hoy.")
+
+# ------------------------------------------------------------------ reglas y normas fijas
+AREAS_ORIGEN = ["ALMAC", "ALMPIC"]   # almacenamiento y almacenamiento picking
+VIDA_UTIL_MIN = 0                    # solo se excluyen LPN vencidos
+PERMITIR_PARCIAL = True              # se pueden sacar cajas sin mover el LPN completo
+fecha_ref = datetime.now(ZoneInfo("America/Santiago")).date()
 
 if not (f_cuad and f_vu):
     st.info("⬅️ Sube la **cuadratura de stock** y las **operaciones de vida útil** para calcular los movimientos.")
@@ -92,19 +87,14 @@ if not (f_cuad and f_vu):
 try:
     cuad = motor.cargar_cuadratura(f_cuad)
     vu = motor.cargar_vida_util(f_vu)
-    if f_ub or f_pr or f_zm:
-        ub, pr, zm = motor.cargar_maestros(f_ub or os.path.join(M, "ubicaciones.csv"),
-                                           f_pr or os.path.join(M, "preferencia.csv"),
-                                           f_zm or os.path.join(M, "zonas.csv"))
-    else:
-        ub, pr, zm = maestros()
-    pal = motor.cargar_paletizado(f_pal) if f_pal else paletizado_base()
+    ub, pr, zm = maestros()
+    pal = paletizado_base()
     if not zonas_sel:
         st.warning("Elige al menos una zona a llenar en la barra lateral.")
         st.stop()
-    movs, resumen, alertas = motor.calcular(cuad, vu, ub, pr, zm, paletizado=pal, areas_origen=areas,
-                                            tolerancia_dias=int(tol), vida_util_min=int(vu_min),
-                                            permitir_parcial=parcial, fecha_ref=fecha_ref,
+    movs, resumen, alertas = motor.calcular(cuad, vu, ub, pr, zm, paletizado=pal, areas_origen=AREAS_ORIGEN,
+                                            tolerancia_dias=int(tol), vida_util_min=VIDA_UTIL_MIN,
+                                            permitir_parcial=PERMITIR_PARCIAL, fecha_ref=fecha_ref,
                                             zonas_destino=[{"ZM_CAJAS": "ZM_CAJ", "ZM_PALLET": "ZM_PICK"}[z]
                                                            for z in zonas_sel])
 except Exception as e:
@@ -162,7 +152,8 @@ with tab4:
         por_pasillo = st.checkbox("Una hoja por pasillo (salto de página)", value=True)
 
         sel = base_h[base_h["pasillo_destino"].isin(pasillos_h)] if pasillos_h else base_h
-        sel = sel.sort_values(["pasillo_destino", "ubicacion_destino", "caducidad"])
+        # orden de la hoja: mayor cantidad de cajas a reponer primero
+        sel = sel.sort_values(["cajas_a_mover", "ubicacion_destino"], ascending=[False, True])
         hoja = motor.hoja_operarios(sel)
 
         if hoja.empty:
@@ -219,10 +210,10 @@ with tab3:
 params = {
     "Fecha de referencia": fecha_ref.strftime("%d-%m-%Y"),
     "Zonas a llenar": ", ".join(zonas_sel),
-    "Áreas de origen": ", ".join(areas),
+    "Áreas de origen": ", ".join(AREAS_ORIGEN),
     "Tolerancia FEFO (días)": int(tol),
-    "Vida útil mínima (días)": int(vu_min),
-    "Permitir parcial": "Sí" if parcial else "No",
+    "Vida útil mínima (días)": VIDA_UTIL_MIN,
+    "Permitir parcial": "Sí" if PERMITIR_PARCIAL else "No",
     "Archivo cuadratura": f_cuad.name,
     "Archivo vida útil": f_vu.name,
 }
