@@ -45,6 +45,7 @@ def paletizado_base():
 
 # ------------------------------------------------------------------ barra lateral
 with st.sidebar:
+    kpi_tareas = st.empty()   # indicador de tareas (se llena después de calcular)
     st.header("1. Archivos")
     f_cuad = st.file_uploader("Cuadratura de stock (.csv)", type=["csv"])
     f_vu = st.file_uploader("Operaciones de vida útil (.csv)", type=["csv"])
@@ -101,112 +102,86 @@ except Exception as e:
     st.error(f"No se pudo procesar: {e}")
     st.stop()
 
-# ------------------------------------------------------------------ indicadores
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Tareas de movimiento", f"{len(movs):,}".replace(",", "."))
-c2.metric("Cajas a mover", f"{int(movs['cajas_a_mover'].sum()) if len(movs) else 0:,}".replace(",", "."))
-c3.metric("Ubicaciones que quedan llenas", int((resumen["estado"] == "Queda llena").sum()))
-c4.metric("Sin stock para reponer", int((resumen["estado"] == "Sin stock en almacenamiento").sum()))
-c5.metric("LPN restos liberados",
-          int(((movs["tipo_lpn"] == "Resto") & (movs["queda_en_lpn"] == 0)).sum()) if len(movs) else 0)
+# ------------------------------------------------------------------ indicador (barra lateral)
+kpi_tareas.metric("Tareas de movimiento", f"{len(movs):,}".replace(",", "."))
 
-tab1, tab4, tab2, tab3 = st.tabs(["🚚 Movimientos", "🖨️ Hoja para operarios",
-                                  "📍 Resumen por ubicación", "⚠️ Alertas"])
 
-with tab1:
-    if movs.empty:
-        st.warning("No hay movimientos por realizar con los parámetros actuales.")
+def excel_reporte(hojas: dict, parametros: dict) -> bytes:
+    """Reporte con el detalle: Movimientos, Resumen por ubicación y Alertas."""
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="dd-mm-yyyy") as xw:
+        head = xw.book.add_format({"bold": True, "font_name": "Arial", "font_size": 10, "bg_color": "#1F3864",
+                                   "font_color": "white", "border": 1, "valign": "vcenter"})
+        body = xw.book.add_format({"font_name": "Arial", "font_size": 10})
+        for nombre, df in hojas.items():
+            df = df if not df.empty else pd.DataFrame({"info": ["Sin registros"]})
+            df.to_excel(xw, sheet_name=nombre, index=False)
+            ws = xw.sheets[nombre]
+            for j, col in enumerate(df.columns):
+                ws.write(0, j, col, head)
+                ancho = max(len(str(col)), df[col].astype(str).str.len().max())
+                ws.set_column(j, j, min(max(ancho + 2, 10), 45), body)
+            ws.freeze_panes(1, 0)
+            ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+        pd.DataFrame(list(parametros.items()), columns=["Parámetro", "Valor"]).to_excel(
+            xw, sheet_name="Parámetros", index=False)
+        xw.sheets["Parámetros"].set_column(0, 1, 40, body)
+    return buf.getvalue()
+
+
+# ------------------------------------------------------------------ hoja para operarios
+st.subheader("🖨️ Hoja para operarios")
+if movs.empty:
+    st.warning("No hay movimientos por realizar con los archivos cargados.")
+else:
+    h1, h2 = st.columns([1, 2])
+    zonas_h = h1.multiselect("Zona", sorted(movs["zona"].unique()),
+                             default=sorted(movs["zona"].unique()), key="h_zona")
+    base_h = movs[movs["zona"].isin(zonas_h)] if zonas_h else movs
+    pasillos_h = h2.multiselect("Pasillo destino (primer tramo de la ubicación)",
+                                sorted(base_h["pasillo_destino"].unique()),
+                                placeholder="Todos los pasillos", key="h_pas")
+    por_pasillo = st.checkbox("Una hoja por pasillo (salto de página)", value=True)
+
+    sel = base_h[base_h["pasillo_destino"].isin(pasillos_h)] if pasillos_h else base_h
+    # orden de la hoja: mayor cantidad de cajas a reponer primero
+    sel = sel.sort_values(["cajas_a_mover", "ubicacion_destino"], ascending=[False, True])
+    hoja = motor.hoja_operarios(sel)
+
+    if hoja.empty:
+        st.info("No hay tareas con esos filtros.")
     else:
-        f0, f1, f2, f3 = st.columns(4)
-        zn = f0.multiselect("Zona", sorted(movs["zona"].unique()), key="mv_zona")
-        pa = f1.multiselect("Pasillo destino", sorted(movs["pasillo_destino"].unique()), key="mv_pas")
-        tipo = f2.multiselect("Tipo de LPN origen", ["Resto", "Pallet completo"])
-        buscar = f3.text_input("Buscar artículo / ubicación / LPN")
-        vista = movs.copy()
-        if zn:
-            vista = vista[vista["zona"].isin(zn)]
-        if pa:
-            vista = vista[vista["pasillo_destino"].isin(pa)]
-        if tipo:
-            vista = vista[vista["tipo_lpn"].isin(tipo)]
-        if buscar:
-            b = buscar.upper()
-            vista = vista[vista.apply(lambda r: b in " ".join(map(str, r.values)).upper(), axis=1)]
-        st.dataframe(vista, use_container_width=True, hide_index=True,
-                     column_config={"caducidad": st.column_config.DateColumn("caducidad", format="DD-MM-YYYY")})
-        st.caption("Tipo de LPN según la norma de cajas por pallet de la BBDD. "
-                   "pct_pallet = % del pallet que tiene el LPN. Si fuente_norma = Estimada, "
-                   "el artículo no está en la BBDD y se usa el mayor LPN visto.")
+        fecha_hora = datetime.now(ZoneInfo("America/Santiago")).strftime("%d-%m-%Y %H:%M")
+        filtros = f"Zona: {', '.join(zonas_h) or 'Todas'} | Pasillos: {', '.join(pasillos_h) or 'Todos'}"
+        html_report = motor.html_hoja_ruta(hoja, fecha_hora, filtros, pagina_por_pasillo=por_pasillo)
 
-with tab4:
-    if movs.empty:
-        st.warning("No hay movimientos para imprimir.")
-    else:
-        h1, h2 = st.columns([1, 2])
-        zonas_h = h1.multiselect("Zona", sorted(movs["zona"].unique()),
-                                 default=sorted(movs["zona"].unique()), key="h_zona")
-        base_h = movs[movs["zona"].isin(zonas_h)] if zonas_h else movs
-        pasillos_disp = sorted(base_h["pasillo_destino"].unique())
-        pasillos_h = h2.multiselect("Pasillo destino (primer tramo de la ubicación)", pasillos_disp,
-                                    placeholder="Todos los pasillos", key="h_pas")
-        por_pasillo = st.checkbox("Una hoja por pasillo (salto de página)", value=True)
+        components.html(
+            f"""
+            {html_report}
+            <div style="margin-top:15px; text-align:center;" class="no-print">
+                <button onclick="window.print()" style="background-color:#2563EB; color:white;
+                    font-weight:bold; padding:12px 24px; font-size:16px; border:none;
+                    border-radius:6px; cursor:pointer;">🖨️ Imprimir Hoja de Ruta</button>
+            </div>
+            """,
+            height=800, scrolling=True,
+        )
 
-        sel = base_h[base_h["pasillo_destino"].isin(pasillos_h)] if pasillos_h else base_h
-        # orden de la hoja: mayor cantidad de cajas a reponer primero
-        sel = sel.sort_values(["cajas_a_mover", "ubicacion_destino"], ascending=[False, True])
-        hoja = motor.hoja_operarios(sel)
+        sufijo = "_".join(pasillos_h) if pasillos_h else "todos"
+        d1, d2 = st.columns(2)
+        d1.download_button("⬇️ Hoja para operarios (HTML)",
+                           data=f"<html><head><meta charset='utf-8'></head><body>{html_report}</body></html>",
+                           file_name=f"hoja_ruta_pasillo_{sufijo}.html", mime="text/html",
+                           use_container_width=True)
+        d2.download_button("⬇️ Hoja para operarios (Excel)",
+                           data=motor.a_excel_hoja(hoja, {"Emisión": fecha_hora, "Filtros": filtros}),
+                           file_name=f"hoja_ruta_pasillo_{sufijo}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           use_container_width=True)
 
-        if hoja.empty:
-            st.info("No hay tareas con esos filtros.")
-        else:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Tareas", len(hoja))
-            m2.metric("Cajas", int(hoja["Cantidad solicitada"].sum()))
-            m3.metric("Pasillos", hoja["Pasillo"].nunique())
-
-            fecha_hora = datetime.now(ZoneInfo("America/Santiago")).strftime("%d-%m-%Y %H:%M")
-            filtros = f"Zona: {', '.join(zonas_h) or 'Todas'} | Pasillos: {', '.join(pasillos_h) or 'Todos'}"
-            html_report = motor.html_hoja_ruta(hoja, fecha_hora, filtros, pagina_por_pasillo=por_pasillo)
-
-            components.html(
-                f"""
-                {html_report}
-                <div style="margin-top:15px; text-align:center;" class="no-print">
-                    <button onclick="window.print()" style="background-color:#2563EB; color:white;
-                        font-weight:bold; padding:12px 24px; font-size:16px; border:none;
-                        border-radius:6px; cursor:pointer;">🖨️ Imprimir Hoja de Ruta</button>
-                </div>
-                """,
-                height=800, scrolling=True,
-            )
-
-            d1, d2 = st.columns(2)
-            sufijo = "_".join(pasillos_h) if pasillos_h else "todos"
-            d1.download_button("⬇️ Descargar hoja (HTML para imprimir)",
-                               data=f"<html><head><meta charset='utf-8'></head><body>{html_report}</body></html>",
-                               file_name=f"hoja_ruta_pasillo_{sufijo}.html", mime="text/html")
-            d2.download_button("⬇️ Descargar hoja (Excel)",
-                               data=motor.a_excel_hoja(hoja, {"Emisión": fecha_hora, "Filtros": filtros}),
-                               file_name=f"hoja_ruta_pasillo_{sufijo}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-with tab2:
-    est = st.multiselect("Estado", sorted(resumen["estado"].unique()),
-                         default=[e for e in resumen["estado"].unique() if e != "Ya estaba llena"])
-    st.dataframe(resumen[resumen["estado"].isin(est)] if est else resumen,
-                 use_container_width=True, hide_index=True)
-    st.bar_chart(resumen["estado"].value_counts())
-
-with tab3:
-    if alertas.empty:
-        st.success("Sin alertas.")
-    else:
-        st.dataframe(alertas["tipo"].value_counts().rename("cantidad"), use_container_width=True)
-        tip = st.selectbox("Ver detalle de", ["Todas"] + sorted(alertas["tipo"].unique()))
-        st.dataframe(alertas if tip == "Todas" else alertas[alertas["tipo"] == tip],
-                     use_container_width=True, hide_index=True)
-
-# ------------------------------------------------------------------ descarga
+# ------------------------------------------------------------------ reporte (Excel con el detalle)
+st.divider()
 params = {
     "Fecha de referencia": fecha_ref.strftime("%d-%m-%Y"),
     "Zonas a llenar": ", ".join(zonas_sel),
@@ -217,8 +192,10 @@ params = {
     "Archivo cuadratura": f_cuad.name,
     "Archivo vida útil": f_vu.name,
 }
-st.download_button("⬇️ Descargar Excel de movimientos",
-                   data=motor.a_excel(movs, resumen, alertas, params),
-                   file_name=f"llenado_ZM_CAJA_{fecha_ref:%Y%m%d}.xlsx",
+st.download_button("📊 Reporte",
+                   data=excel_reporte({"Movimientos": movs, "Resumen por ubicación": resumen,
+                                       "Alertas": alertas}, params),
+                   file_name=f"reporte_abastecimiento_{fecha_ref:%Y%m%d}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                   type="primary")
+                   type="primary", use_container_width=True,
+                   help="Excel con Movimientos, Resumen por ubicación y Alertas")
