@@ -279,6 +279,11 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
         for _, d in grupo_dest.iterrows():
             falta = d["faltante"]
             asignado = 0
+            n_pallets = 0
+            # ZM_PALLET (ZM_PICK): solo pallets completos, LPN entero, nunca cajas sueltas
+            es_zm_pallet = str(d["zona_movimiento"]).upper() == "ZM_PICK"
+            norma_art = norma.get(art) if art in norma.index else (
+                cand["norma_pallet"].iloc[0] if not cand.empty else None)
             if falta > 0 and not cand.empty:
                 for idx in cand.index:
                     rest = lpns.at[idx, "restante"]
@@ -286,7 +291,11 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
                         continue
                     if falta <= 0:
                         break
-                    if not permitir_parcial and rest > falta:
+                    if es_zm_pallet:
+                        # solo LPN que sigan siendo pallet completo y que quepan enteros
+                        if rest < lpns.at[idx, "norma_pallet"] or rest > falta:
+                            continue
+                    elif not permitir_parcial and rest > falta:
                         # no abrir el LPN: se detiene para no saltarse FEFO
                         break
                     tomar = min(rest, falta)
@@ -313,12 +322,20 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
                         "pasillo_destino": d["pasillo"],
                         "zona": d["zona"],
                         "zona_trabajo": d["zona_trabajo"],
+                        "pallets_a_mover": 1 if es_zm_pallet else 0,
                     })
+                    n_pallets += 1 if es_zm_pallet else 0
                     lpns.at[idx, "restante"] = rest - tomar
                     falta -= tomar
                     asignado += tomar
             if d["ubicacion"] in ubic_mezcla:
                 estado = "Bloqueada (otro artículo)"
+            elif d["faltante"] <= 0:
+                estado = "Ya estaba llena"
+            elif es_zm_pallet and norma_art and d["faltante"] < norma_art:
+                estado = "Llena (no cabe un pallet completo)" if n_pallets == 0 else "Queda llena"
+            elif es_zm_pallet and norma_art and n_pallets > 0 and (d["faltante"] - asignado) < norma_art:
+                estado = "Queda llena"
             elif d["faltante"] <= 0:
                 estado = "Ya estaba llena"
             elif asignado >= d["faltante"]:
@@ -334,7 +351,9 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
                 "capacidad": int(d["capacidad"]), "stock_actual": int(d["stock_actual"]),
                 "faltante": int(d["faltante"]), "a_reponer": int(asignado),
                 "stock_final": int(d["stock_actual"] + asignado),
-                "pendiente": int(d["faltante"] - asignado), "estado": estado,
+                "pendiente": int(d["faltante"] - asignado),
+                "pallets_a_reponer": int(n_pallets) if es_zm_pallet else None,
+                "estado": estado,
             })
 
     movs = pd.DataFrame(movs)
@@ -344,7 +363,7 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
     if not resumen.empty:
         resumen = resumen.merge(desc, on="articulo", how="left")
         cols = ["secuencia", "ubicacion_destino", "pasillo_destino", "zona", "zona_trabajo", "articulo", "descripcion", "capacidad",
-                "stock_actual", "faltante", "a_reponer", "stock_final", "pendiente", "estado"]
+                "stock_actual", "faltante", "a_reponer", "pallets_a_reponer", "stock_final", "pendiente", "estado"]
         resumen = resumen[cols].sort_values(["secuencia", "ubicacion_destino"])
     if not movs.empty:
         movs = movs.sort_values(["secuencia", "ubicacion_destino", "caducidad"]).reset_index(drop=True)
@@ -422,7 +441,9 @@ def hoja_operarios(movs: pd.DataFrame, incluir_lpn: bool = False) -> pd.DataFram
         "Descripción": df["descripcion"].values,
         "Ubicación origen": df["ubicacion_origen"].values,
         "Ubicación destino": df["ubicacion_destino"].values,
-        "Cantidad solicitada": df["cajas_a_mover"].values,
+        "Cantidad solicitada": [1 if z == "ZM_PALLET" else c
+                                for z, c in zip(df["zona"], df["cajas_a_mover"])],
+        "Unidad": ["PALLET" if z == "ZM_PALLET" else "CAJAS" for z in df["zona"]],
     })
     if incluir_lpn:
         out.insert(6, "LPN", df["lpn"].values)
@@ -436,6 +457,15 @@ def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por
     cols_extra = [c for c in ["LPN", "Vence"] if c in hoja.columns]
     cab_extra = "".join(f"<th>{c}</th>" for c in cols_extra)
 
+    def totales(df):
+        es_pal = df.get("Unidad", pd.Series("CAJAS", index=df.index)) == "PALLET"
+        txt = ""
+        if (~es_pal).any():
+            txt += f" &nbsp;·&nbsp; Cajas: {int(df.loc[~es_pal, 'Cantidad solicitada'].sum())}"
+        if es_pal.any():
+            txt += f" &nbsp;·&nbsp; Pallets: {int(es_pal.sum())}"
+        return txt
+
     def bloque(df, titulo_pasillo):
         filas = ""
         for i, (_, r) in enumerate(df.iterrows(), start=1):
@@ -448,7 +478,7 @@ def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por
               <td class="c b org">{escape(str(r['Ubicación origen']))}</td>
               <td class="c b dst">{escape(str(r['Ubicación destino']))}</td>
               {extra}
-              <td class="c b qty">{int(r['Cantidad solicitada'])}</td>
+              <td class="c b qty">{"1 PALLET" if r.get("Unidad") == "PALLET" else int(r['Cantidad solicitada'])}</td>
               <td class="chk"></td>
             </tr>"""
         zonas_txt = ", ".join(sorted(df["Zona"].unique()))
@@ -458,7 +488,7 @@ def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por
             <tr><td class="title">Reabasto ZM / Hoja de Ruta</td>
                 <td class="r small"><strong>Fecha emisión:</strong> {fecha_hora}</td></tr>
             <tr><td class="sub"><strong>{titulo_pasillo}</strong> &nbsp;·&nbsp; Zona: {zonas_txt}
-                 &nbsp;·&nbsp; Tareas: {len(df)} &nbsp;·&nbsp; Cajas: {int(df['Cantidad solicitada'].sum())}</td>
+                 &nbsp;·&nbsp; Tareas: {len(df)}{totales(df)}</td>
                 <td class="r small">{escape(filtros)}</td></tr>
           </table>
           <table class="data-table">
