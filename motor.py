@@ -113,6 +113,8 @@ def cargar_maestros(ruta_ubic, ruta_pref, ruta_zonas):
                                   "ZONA DE MOVIMIENTO": "zona_movimiento", "ZONA DE RECOGIDA": "zona_recogida"})
     for c in zonas.columns:
         zonas[c] = _txt(zonas[c])
+    # en el WMS algunas ubicaciones de pallet vienen como ZM_PALLET: se tratan igual que ZM_PICK
+    zonas["zona_movimiento"] = zonas["zona_movimiento"].str.upper().replace({"ZM_PALLET": "ZM_PICK"})
     return ubic, pref, zonas
 
 
