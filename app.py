@@ -10,6 +10,8 @@ import streamlit as st
 import motor
 
 st.set_page_config(page_title="Abastecimiento Picking | CD Coquimbo", page_icon="📦", layout="wide")
+import tema  # noqa: E402
+tema.aplicar()
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 M = os.path.join(BASE, "maestros")
@@ -21,8 +23,6 @@ st.markdown("""
 .block-container {padding-top: 1.5rem;}
 .titulo {font-size: 1.8rem; font-weight: 700; color: inherit; margin-bottom: 0;}
 .sub {color: #666; margin-top: 0;}
-div[data-testid="stMetric"] {background: rgba(59, 130, 246, 0.10); border-radius: 10px;
-                             padding: 10px 14px; border-left: 5px solid #3B82F6;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -160,7 +160,7 @@ else:
             f"""
             {html_report}
             <div style="margin-top:15px; text-align:center;" class="no-print">
-                <button onclick="window.print()" style="background-color:#2563EB; color:white;
+                <button onclick="window.print()" style="background-color:#5BB030; color:white;
                     font-weight:bold; padding:12px 24px; font-size:16px; border:none;
                     border-radius:6px; cursor:pointer;">🖨️ Imprimir Hoja de Ruta</button>
             </div>
