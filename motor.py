@@ -453,8 +453,15 @@ def hoja_operarios(movs: pd.DataFrame, incluir_lpn: bool = False) -> pd.DataFram
     return out
 
 
-def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por_pasillo: bool = True) -> str:
-    """HTML imprimible (mismo patrón de la hoja de ruta de reabasto)."""
+def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, modo: str = "continuo") -> str:
+    """HTML imprimible (mismo patrón de la hoja de ruta de reabasto).
+
+    modo:
+      - "continuo": un solo encabezado, tablas agrupadas por pasillo una tras otra SIN salto
+                    de página (las hojas se llenan por tamaño, ahorra papel). Por defecto.
+      - "pasillo":  una hoja por pasillo (salto de página entre pasillos).
+      - "unico":    una sola tabla con todas las tareas, sin agrupar.
+    """
     from html import escape
     cols_extra = [c for c in ["LPN", "Vence"] if c in hoja.columns]
     cab_extra = "".join(f"<th>{c}</th>" for c in cols_extra)
@@ -468,7 +475,20 @@ def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por
             txt += f" &nbsp;·&nbsp; Pallets: {int(es_pal.sum())}"
         return txt
 
-    def bloque(df, titulo_pasillo):
+    def zonas(df):
+        return ", ".join(sorted(df["Zona"].unique()))
+
+    def encabezado(df, titulo):
+        return f"""
+          <table class="header-table">
+            <tr><td class="title">Reabasto ZM / Hoja de Ruta</td>
+                <td class="r small"><strong>Fecha emisión:</strong> {fecha_hora}</td></tr>
+            <tr><td class="sub"><strong>{titulo}</strong> &nbsp;·&nbsp; Zona: {zonas(df)}
+                 &nbsp;·&nbsp; Tareas: {len(df)}{totales(df)}</td>
+                <td class="r small">{escape(filtros)}</td></tr>
+          </table>"""
+
+    def tabla(df):
         filas = ""
         for i, (_, r) in enumerate(df.iterrows(), start=1):
             extra = "".join(f'<td class="c mono">{escape(str(r[c]))}</td>' for c in cols_extra)
@@ -483,35 +503,38 @@ def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por
               <td class="c b qty">{"1 PALLET" if r.get("Unidad") == "PALLET" else int(r['Cantidad solicitada'])}</td>
               <td class="chk"></td>
             </tr>"""
-        zonas_txt = ", ".join(sorted(df["Zona"].unique()))
         return f"""
-        <div class="report-card">
-          <table class="header-table">
-            <tr><td class="title">Reabasto ZM / Hoja de Ruta</td>
-                <td class="r small"><strong>Fecha emisión:</strong> {fecha_hora}</td></tr>
-            <tr><td class="sub"><strong>{titulo_pasillo}</strong> &nbsp;·&nbsp; Zona: {zonas_txt}
-                 &nbsp;·&nbsp; Tareas: {len(df)}{totales(df)}</td>
-                <td class="r small">{escape(filtros)}</td></tr>
-          </table>
           <table class="data-table">
             <thead><tr>
               <th>#</th><th>SKU</th><th>Descripción producto</th><th>Origen</th><th>Destino</th>
               {cab_extra}<th>Cantidad</th><th>Check (✓)</th>
             </tr></thead>
             <tbody>{filas}</tbody>
-          </table>
+          </table>"""
+
+    firmas = """
           <table class="firmas"><tr>
             <td>Operario: ____________________</td><td>Hora inicio: ______</td>
             <td>Hora término: ______</td><td>Firma: ____________________</td>
-          </tr></table>
-        </div>"""
+          </tr></table>"""
 
-    if pagina_por_pasillo:
-        partes = [bloque(g, f"Pasillo {p}") for p, g in hoja.groupby("Pasillo", sort=True)]
-    else:
+    if modo == "pasillo":
+        partes = [f'<div class="report-card">{encabezado(g, f"Pasillo {p}")}{tabla(g)}{firmas}</div>'
+                  for p, g in hoja.groupby("Pasillo", sort=True)]
+        cuerpo = '<div class="salto"></div>'.join(partes)
+    elif modo == "unico":
         pas = ", ".join(sorted(hoja["Pasillo"].unique()))
-        partes = [bloque(hoja, f"Pasillos: {pas}")]
-    cuerpo = '<div class="salto"></div>'.join(partes)
+        cuerpo = f'<div class="report-card">{encabezado(hoja, f"Pasillos: {pas}")}{tabla(hoja)}{firmas}</div>'
+    else:  # continuo
+        pas = ", ".join(sorted(hoja["Pasillo"].unique()))
+        secciones = "".join(
+            f"""<div class="seccion">
+                  <div class="sec-tit">Pasillo {p} &nbsp;·&nbsp; Zona: {zonas(g)}
+                       &nbsp;·&nbsp; Tareas: {len(g)}{totales(g)}</div>
+                  {tabla(g)}
+                </div>"""
+            for p, g in hoja.groupby("Pasillo", sort=True))
+        cuerpo = f'<div class="report-card">{encabezado(hoja, f"Pasillos: {pas}")}{secciones}{firmas}</div>'
 
     return f"""
     <style>
@@ -533,6 +556,9 @@ def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por
       .mono {{ font-family:monospace; font-size:13px; }}
       .org {{ color:#1E3A8A; font-size:14px; }} .dst {{ color:#065F46; font-size:14px; }}
       .qty {{ font-size:16px; }} .chk {{ width:70px; }}
+      .seccion {{ margin-top:12px; }}
+      .sec-tit {{ font-size:14px; font-weight:bold; color:#fff; background:#5BB030; padding:5px 8px;
+                  border-radius:4px; }}
       .firmas {{ width:100%; margin-top:14px; font-size:12px; }}
       .firmas td {{ padding-top:10px; }}
       @media print {{
@@ -542,6 +568,12 @@ def html_hoja_ruta(hoja: pd.DataFrame, fecha_hora: str, filtros: str, pagina_por
         .salto {{ page-break-after:always; break-after:page; }}
         .data-table tr {{ page-break-inside:avoid; }}
         .data-table thead {{ display:table-header-group; }}
+        .data-table th {{ padding:4px 4px; font-size:11px; }}
+        .data-table td {{ padding:4px 4px; font-size:12px; }}
+        .sec-tit {{ break-after:avoid; page-break-after:avoid;
+                    -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
+        .data-table th {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
+        .seccion {{ margin-top:8px; }}
         @page {{ size: A4 landscape; margin: 10mm; }}
       }}
     </style>

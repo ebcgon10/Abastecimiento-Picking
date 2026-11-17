@@ -142,7 +142,10 @@ else:
     pasillos_h = h2.multiselect("Pasillo destino (primer tramo de la ubicación)",
                                 sorted(base_h["pasillo_destino"].unique()),
                                 placeholder="Todos los pasillos", key="h_pas")
-    por_pasillo = st.checkbox("Una hoja por pasillo (salto de página)", value=True)
+    MODOS = {"Todo seguido, agrupado por pasillo (ahorra hojas)": "continuo",
+             "Una hoja por pasillo (salto de página)": "pasillo",
+             "Lista única sin agrupar": "unico"}
+    modo_txt = st.radio("Formato de impresión", list(MODOS), index=0, horizontal=True)
 
     sel = base_h[base_h["pasillo_destino"].isin(pasillos_h)] if pasillos_h else base_h
     # orden de la hoja: mayor cantidad de cajas a reponer primero
@@ -154,7 +157,7 @@ else:
     else:
         fecha_hora = datetime.now(ZoneInfo("America/Santiago")).strftime("%d-%m-%Y %H:%M")
         filtros = f"Zona: {', '.join(zonas_h) or 'Todas'} | Pasillos: {', '.join(pasillos_h) or 'Todos'}"
-        html_report = motor.html_hoja_ruta(hoja, fecha_hora, filtros, pagina_por_pasillo=por_pasillo)
+        html_report = motor.html_hoja_ruta(hoja, fecha_hora, filtros, modo=MODOS[modo_txt])
 
         components.html(
             f"""
