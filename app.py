@@ -47,8 +47,8 @@ def paletizado_base():
 with st.sidebar:
     kpi_tareas = st.empty()   # indicador de tareas (se llena después de calcular)
     st.header("1. Archivos")
-    f_cuad = st.file_uploader("Cuadratura de stock (.csv)", type=["csv"])
-    f_vu = st.file_uploader("Operaciones de vida útil (.csv)", type=["csv"])
+    f_vu = st.file_uploader("Operaciones de vida útil (.csv)", type=["csv"],
+                            help="Único archivo: trae área, ubicación, LPN, cantidad, estado y caducidad.")
 
     st.header("2. Parámetros")
     zonas_sel = st.multiselect("Zonas a llenar", ["ZM_CAJAS", "ZM_PALLET"], default=["ZM_CAJAS"],
@@ -68,15 +68,14 @@ VIDA_UTIL_MIN = 0                    # solo se excluyen LPN vencidos
 PERMITIR_PARCIAL = True              # se pueden sacar cajas sin mover el LPN completo
 fecha_ref = datetime.now(ZoneInfo("America/Santiago")).date()
 
-if not (f_cuad and f_vu):
-    st.info("⬅️ Sube la **cuadratura de stock** y las **operaciones de vida útil** para calcular los movimientos.")
+if not f_vu:
+    st.info("⬅️ Sube las **operaciones de vida útil** para calcular los movimientos.")
     with st.expander("¿Cómo calcula la app?", expanded=True):
         st.markdown("""
 1. **Destinos:** ubicaciones de zona de movimiento **ZM_CAJ** con artículo asignado en preferencias.
-2. **Faltante:** capacidad máxima (cajas) − stock actual del artículo en la ubicación.
+2. **Faltante:** capacidad máxima (cajas) − stock actual en la ubicación (según vida útil).
    Si la ubicación tiene otro artículo, se bloquea y se informa en Alertas.
-3. **Origen:** solo LPN en **ALMAC / ALMPIC**, estado **D**, que estén en la **cuadratura de stock**.
-   Si vida útil y cuadratura no cuadran, se usa el menor valor.
+3. **Origen:** solo LPN en **ALMAC / ALMPIC**, estado **D**, según **operaciones de vida útil**.
 4. **Orden de consumo:** **FEFO** (vence primero, sale primero). A igual vencimiento se toman
    primero los **restos** (LPN con menos cajas que la norma de paletizado de la BBDD),
    luego los de menos cajas y, a igualdad, los de niveles superiores,
@@ -86,14 +85,13 @@ if not (f_cuad and f_vu):
 
 # ------------------------------------------------------------------ cálculo
 try:
-    cuad = motor.cargar_cuadratura(f_cuad)
     vu = motor.cargar_vida_util(f_vu)
     ub, pr, zm = maestros()
     pal = paletizado_base()
     if not zonas_sel:
         st.warning("Elige al menos una zona a llenar en la barra lateral.")
         st.stop()
-    movs, resumen, alertas = motor.calcular(cuad, vu, ub, pr, zm, paletizado=pal, areas_origen=AREAS_ORIGEN,
+    movs, resumen, alertas = motor.calcular(vu, ub, pr, zm, paletizado=pal, areas_origen=AREAS_ORIGEN,
                                             tolerancia_dias=int(tol), vida_util_min=VIDA_UTIL_MIN,
                                             permitir_parcial=PERMITIR_PARCIAL, fecha_ref=fecha_ref,
                                             zonas_destino=[{"ZM_CAJAS": "ZM_CAJ", "ZM_PALLET": "ZM_PICK"}[z]
@@ -192,7 +190,6 @@ params = {
     "Tolerancia FEFO (días)": int(tol),
     "Vida útil mínima (días)": VIDA_UTIL_MIN,
     "Permitir parcial": "Sí" if PERMITIR_PARCIAL else "No",
-    "Archivo cuadratura": f_cuad.name,
     "Archivo vida útil": f_vu.name,
 }
 st.download_button("📊 Reporte",

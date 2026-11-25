@@ -4,7 +4,8 @@ Motor de cálculo: llenado completo de ubicaciones ZM_CAJ (cajas) y ZM_PICK (pal
 Reglas:
 1. Destino  = ubicaciones con zona de movimiento ZM_CAJ / ZM_PICK que tienen artículo asignado (PREFERENCIA).
 2. Faltante = capacidad máxima (piezas/cajas) - stock actual del artículo en la ubicación.
-3. Origen   = LPN en áreas ALMAC / ALMPIC, estado D, que existan en la cuadratura de stock.
+3. Origen   = LPN en áreas ALMAC / ALMPIC, estado D, según operaciones de vida útil
+              (único archivo de entrada: trae ubicación, LPN, cantidad y caducidad).
 4. Orden    = FEFO (fecha de caducidad más próxima primero); a igual caducidad (o dentro
               de la tolerancia configurada) se atacan primero los LPN con MENOS cajas (restos),
               para no abrir pallets completos.
@@ -60,18 +61,6 @@ def pasillo_de(ubic: str) -> str:
 
 
 # ------------------------------------------------------------------ carga
-def cargar_cuadratura(archivo) -> pd.DataFrame:
-    df = _leer_csv(archivo)
-    req = {"area", "ubicacion", "articulo", "descripcion", "estado_de_inventario", "cantidad"}
-    faltan = req - set(df.columns)
-    if faltan:
-        raise ValueError(f"A la cuadratura le faltan columnas: {', '.join(sorted(faltan))}")
-    for c in ["area", "ubicacion", "articulo", "descripcion", "estado_de_inventario"]:
-        df[c] = _txt(df[c])
-    df["cantidad"] = _num(df["cantidad"])
-    return df
-
-
 def cargar_vida_util(archivo) -> pd.DataFrame:
     df = _leer_csv(archivo)
     req = {"Area", "Ubicacion", "LPN", "Articulo", "Descripcion", "Cantidad",
@@ -100,6 +89,7 @@ def cargar_maestros(ruta_ubic, ruta_pref, ruta_zonas):
     ubic = ubic.rename(columns={"NOMBRE UBICACIÓN": "ubicacion", "AREA": "area_maestro",
                                 "CAPACIDAD MAXIMA": "capacidad_txt"})
     ubic["ubicacion"] = _txt(ubic["ubicacion"])
+    ubic = ubic.drop_duplicates("ubicacion")
     ubic["capacidad"] = ubic["capacidad_txt"].astype(str).str.extract(r"(\d+)")[0].astype(float)
     ubic["unidad_cap"] = ubic["capacidad_txt"].astype(str).str.extract(r"\d+\s*(\S+)")[0]
 
@@ -107,7 +97,12 @@ def cargar_maestros(ruta_ubic, ruta_pref, ruta_zonas):
                                 "Secuencia": "secuencia"})
     pref["ubicacion"] = _txt(pref["ubicacion"])
     pref["articulo"] = _txt(pref["articulo"])
-    pref["secuencia"] = pd.to_numeric(pref["secuencia"], errors="coerce")
+    if "secuencia" in pref.columns:
+        pref["secuencia"] = pd.to_numeric(pref["secuencia"], errors="coerce")
+    else:
+        # maestro nuevo (gemelo) sin columna Secuencia: se usa el orden del archivo (ubicación ascendente)
+        pref["secuencia"] = range(1, len(pref) + 1)
+    pref = pref[pref["ubicacion"] != ""].drop_duplicates(["ubicacion", "articulo"])
 
     zonas = zonas.rename(columns={"UBICACIÓN": "ubicacion", "ZONA DE TRABAJO": "zona_trabajo",
                                   "ZONA DE MOVIMIENTO": "zona_movimiento", "ZONA DE RECOGIDA": "zona_recogida"})
@@ -137,7 +132,7 @@ def cargar_paletizado(archivo) -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------ cálculo
-def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.DataFrame,
+def calcular(vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.DataFrame,
              zonas: pd.DataFrame, paletizado: pd.DataFrame = None, areas_origen=None, tolerancia_dias: int = 0,
              vida_util_min: int = 0, permitir_parcial: bool = True, fecha_ref=None,
              zonas_destino=None):
@@ -160,16 +155,30 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
                         "articulo": "", "detalle": "No existe en hoja de preferencias"})
     dest = dest[~dest.index.isin(sin_art.index)].copy()
 
-    # stock actual en la ubicación destino (todas las filas de la cuadratura)
-    stock_ubic = cuad[cuad["ubicacion"].isin(dest["ubicacion"])]
+    # stock actual en la ubicación destino: todas las filas de vida útil (cualquier estado)
+    inv = vu.rename(columns={"Ubicacion": "ubicacion", "Articulo": "articulo", "Cantidad": "cantidad",
+                             "Estado de inventario": "estado_de_inventario"})
+    stock_ubic = inv[inv["ubicacion"].isin(dest["ubicacion"])]
     st_art = (stock_ubic.groupby(["ubicacion", "articulo"], as_index=False)["cantidad"].sum()
               .rename(columns={"cantidad": "stock_actual"}))
     dest = dest.merge(st_art, on=["ubicacion", "articulo"], how="left")
     dest["stock_actual"] = dest["stock_actual"].fillna(0)
 
-    # ubicaciones ocupadas por otro artículo -> no se reponen
-    otros = stock_ubic.merge(dest[["ubicacion", "articulo"]], on="ubicacion", suffixes=("", "_pref"))
-    otros = otros[otros["articulo"] != otros["articulo_pref"]]
+    # ubicaciones con más de un artículo en preferencias: comparten la capacidad
+    n_art = dest.groupby("ubicacion")["articulo"].transform("nunique")
+    for u, g in dest[n_art > 1].groupby("ubicacion"):
+        alertas.append({"tipo": "Ubicación con más de un artículo en preferencias", "ubicacion": u,
+                        "articulo": " / ".join(g["articulo"]),
+                        "detalle": "Comparten la capacidad; se llena en orden de preferencia"})
+
+    # ubicaciones ocupadas por un artículo que no está en preferencias -> no se reponen
+    validos = set(zip(dest["ubicacion"], dest["articulo"]))
+    mask = pd.Series([(u, a) not in validos for u, a in zip(stock_ubic["ubicacion"], stock_ubic["articulo"])],
+                     index=stock_ubic.index, dtype=bool)
+    otros = stock_ubic[mask]
+    otros = otros.groupby(["ubicacion", "articulo", "estado_de_inventario"], as_index=False)["cantidad"].sum()
+    pref_txt = dest.groupby("ubicacion")["articulo"].agg(lambda x: " / ".join(x)).rename("articulo_pref")
+    otros = otros.merge(pref_txt, left_on="ubicacion", right_index=True)
     ubic_mezcla = set(otros["ubicacion"])
     for _, r in otros.iterrows():
         alertas.append({"tipo": "Ubicación con otro artículo (no se repone)", "ubicacion": r["ubicacion"],
@@ -183,9 +192,10 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
                         "articulo": r["articulo"], "detalle": "Revisar hoja UBICACIONES"})
 
     dest["capacidad"] = dest["capacidad"].fillna(0)
-    dest["faltante"] = (dest["capacidad"] - dest["stock_actual"]).clip(lower=0)
+    stock_total_ubic = dest.groupby("ubicacion")["stock_actual"].transform("sum")
+    dest["faltante"] = (dest["capacidad"] - stock_total_ubic).clip(lower=0)
     dest.loc[dest["ubicacion"].isin(ubic_mezcla), "faltante"] = 0
-    sobre = dest[dest["stock_actual"] > dest["capacidad"]]
+    sobre = dest[stock_total_ubic > dest["capacidad"]].drop_duplicates("ubicacion")
     for _, r in sobre.iterrows():
         alertas.append({"tipo": "Sobre capacidad", "ubicacion": r["ubicacion"], "articulo": r["articulo"],
                         "detalle": f"Stock {int(r['stock_actual'])} > capacidad {int(r['capacidad'])}"})
@@ -194,49 +204,23 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
     dest["pasillo"] = dest["ubicacion"].map(pasillo_de)
     dest = dest.sort_values(["prioridad_zona", "secuencia", "ubicacion"]).reset_index(drop=True)
 
-    # ---------- 2. Stock origen: cuadratura (verdad) + vida útil (detalle LPN / fechas)
-    cu_o = cuad[cuad["area"].isin(areas_origen) & (cuad["estado_de_inventario"] == "D")]
-    cu_o = cu_o.groupby(["ubicacion", "articulo", "area"], as_index=False).agg(
-        cant_cuadratura=("cantidad", "sum"), descripcion=("descripcion", "first"))
-
-    vu_o = vu[(vu["Estado de inventario"] == "D")].rename(columns={
-        "Ubicacion": "ubicacion", "Articulo": "articulo", "LPN": "lpn", "Cantidad": "cant_lpn",
+    # ---------- 2. Stock origen: operaciones de vida útil (LPN, cantidad y caducidad)
+    vu_o = vu[vu["Area"].isin(areas_origen) & (vu["Estado de inventario"] == "D")].rename(columns={
+        "Ubicacion": "ubicacion", "Articulo": "articulo", "Area": "area", "LPN": "lpn",
+        "Descripcion": "descripcion", "Cantidad": "disponible",
         "Fecha de caducidad": "caducidad", "Fecha de fabricacion": "fabricacion"})
-    vu_o = vu_o[["ubicacion", "articulo", "lpn", "cant_lpn", "caducidad", "fabricacion"]]
+    lpns = vu_o[["ubicacion", "articulo", "area", "descripcion", "lpn", "disponible",
+                 "caducidad", "fabricacion"]].copy()
 
     # estándar de pallet estimado = máximo de cajas vistas en un LPN del artículo (todas las áreas)
     std_pallet = vu[vu["Estado de inventario"] == "D"].groupby("Articulo")["Cantidad"].max()
 
-    lpns = cu_o.merge(vu_o, on=["ubicacion", "articulo"], how="left")
-
-    # LPN en vida útil (áreas origen) que NO están en la cuadratura -> no se usan
-    vu_area = vu[vu["Area"].isin(areas_origen) & (vu["Estado de inventario"] == "D")]
-    llave_cu = set(zip(cu_o["ubicacion"], cu_o["articulo"]))
-    for _, r in vu_area.iterrows():
-        if (r["Ubicacion"], r["Articulo"]) not in llave_cu:
-            alertas.append({"tipo": "LPN en vida útil que no está en cuadratura (excluido)",
-                            "ubicacion": r["Ubicacion"], "articulo": r["Articulo"],
-                            "detalle": f"LPN {r['LPN']} ({int(r['Cantidad'])} cj)"})
-
-    # sin detalle de LPN / sin fecha -> no se puede asegurar FEFO
-    sin_fecha = lpns[lpns["lpn"].isna() | lpns["caducidad"].isna()]
-    for _, r in sin_fecha.drop_duplicates(["ubicacion", "articulo"]).iterrows():
-        alertas.append({"tipo": "Stock sin fecha de caducidad (excluido por FEFO)", "ubicacion": r["ubicacion"],
-                        "articulo": r["articulo"],
-                        "detalle": f"{int(r['cant_cuadratura'])} cj en cuadratura sin LPN/fecha en vida útil"})
-    lpns = lpns[lpns["lpn"].notna() & lpns["caducidad"].notna()].copy()
-
-    # ajustar a la cuadratura: si vida útil suma más que la cuadratura, se recorta desde el LPN más nuevo
-    lpns = lpns.sort_values(["ubicacion", "articulo", "caducidad", "cant_lpn"])
-    lpns["acum"] = lpns.groupby(["ubicacion", "articulo"])["cant_lpn"].cumsum()
-    previo = lpns["acum"] - lpns["cant_lpn"]
-    lpns["disponible"] = (lpns["cant_cuadratura"] - previo).clip(lower=0).clip(upper=lpns["cant_lpn"])
-    dif = lpns.groupby(["ubicacion", "articulo"]).agg(v=("cant_lpn", "sum"), c=("cant_cuadratura", "first"))
-    for (u, a), r in dif[dif["v"] != dif["c"]].iterrows():
-        alertas.append({"tipo": "Diferencia cuadratura vs vida útil", "ubicacion": u, "articulo": a,
-                        "detalle": f"Cuadratura {int(r['c'])} cj | vida útil {int(r['v'])} cj "
-                                   f"(se usa el menor; FEFO sobre lo que tiene fecha)"})
-    lpns = lpns[lpns["disponible"] > 0].copy()
+    # sin LPN / sin fecha -> no se puede asegurar FEFO
+    sin_fecha = lpns[(lpns["lpn"] == "") | lpns["caducidad"].isna()]
+    for (u, a), g in sin_fecha.groupby(["ubicacion", "articulo"]):
+        alertas.append({"tipo": "Stock sin fecha de caducidad (excluido por FEFO)", "ubicacion": u,
+                        "articulo": a, "detalle": f"{int(g['disponible'].sum())} cj sin LPN/fecha en vida útil"})
+    lpns = lpns[(lpns["lpn"] != "") & lpns["caducidad"].notna() & (lpns["disponible"] > 0)].copy()
 
     # vida útil mínima
     lpns["dias_vida"] = (lpns["caducidad"] - fecha_ref).dt.days
@@ -270,6 +254,7 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
     movs = []
     resumen = []
     lpns["restante"] = lpns["disponible"]
+    falta_ubic = dest.drop_duplicates("ubicacion").set_index("ubicacion")["faltante"].to_dict()
     for art, grupo_dest in dest.groupby("articulo", sort=False):
         cand = lpns[lpns["articulo"] == art].copy()
         if not cand.empty:
@@ -279,7 +264,8 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
             cand = cand.sort_values(["bloque_fefo", "caducidad", "es_pallet", "disponible", "nivel"],
                                     ascending=[True, True, True, True, False])
         for _, d in grupo_dest.iterrows():
-            falta = d["faltante"]
+            falta = min(d["faltante"], falta_ubic.get(d["ubicacion"], 0))
+            falta_ini = falta
             asignado = 0
             n_pallets = 0
             # ZM_PALLET (ZM_PICK): solo pallets completos, LPN entero, nunca cajas sueltas
@@ -330,10 +316,13 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
                     lpns.at[idx, "restante"] = rest - tomar
                     falta -= tomar
                     asignado += tomar
+            falta_ubic[d["ubicacion"]] = falta_ubic.get(d["ubicacion"], 0) - asignado
             if d["ubicacion"] in ubic_mezcla:
                 estado = "Bloqueada (otro artículo)"
             elif d["faltante"] <= 0:
                 estado = "Ya estaba llena"
+            elif falta_ini <= 0:
+                estado = "Llena por el otro artículo de la ubicación"
             elif es_zm_pallet and norma_art and d["faltante"] < norma_art:
                 estado = "Llena (no cabe un pallet completo)" if n_pallets == 0 else "Queda llena"
             elif es_zm_pallet and norma_art and n_pallets > 0 and (d["faltante"] - asignado) < norma_art:
@@ -360,8 +349,8 @@ def calcular(cuad: pd.DataFrame, vu: pd.DataFrame, ubic: pd.DataFrame, pref: pd.
 
     movs = pd.DataFrame(movs)
     resumen = pd.DataFrame(resumen)
-    desc = pd.concat([cuad[["articulo", "descripcion"]], vu[["Articulo", "Descripcion"]].rename(
-        columns={"Articulo": "articulo", "Descripcion": "descripcion"})]).drop_duplicates("articulo")
+    desc = vu[["Articulo", "Descripcion"]].rename(
+        columns={"Articulo": "articulo", "Descripcion": "descripcion"}).drop_duplicates("articulo")
     if not resumen.empty:
         resumen = resumen.merge(desc, on="articulo", how="left")
         cols = ["secuencia", "ubicacion_destino", "pasillo_destino", "zona", "zona_trabajo", "articulo", "descripcion", "capacidad",
