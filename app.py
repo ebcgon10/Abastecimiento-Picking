@@ -7,7 +7,11 @@ import streamlit.components.v1 as components
 import pandas as pd
 import streamlit as st
 
+import importlib
+
 import motor
+
+importlib.reload(motor)  # Streamlit Cloud puede dejar en memoria una versión antigua del motor
 
 st.set_page_config(page_title="Abastecimiento Picking | CD Coquimbo", page_icon="📦", layout="wide")
 import tema  # noqa: E402
